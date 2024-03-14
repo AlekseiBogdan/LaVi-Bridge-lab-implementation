@@ -205,9 +205,6 @@ for param in model.parameters():
       param.requires_grad = True
     l += 1
 
-from google.colab import drive
-drive.mount('/content/drive')
-
 torch.save(model.state_dict(), '/content/drive/MyDrive/lab_4/encoder_transformer.pt')
 
 """## Diffusion Model (U-Net included)

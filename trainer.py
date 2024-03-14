@@ -18,9 +18,8 @@ from torchvision import transforms
 
 from accelerate import Accelerator
 from diffusers.optimization import get_scheduler
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from transformers import AutoTokenizer, T5EncoderModel
 
+from lab_4_bogdan import TransformerModel, forward_diffusion_sample, SimpleUnet, PositionalEncoding
 from lora import inject_trainable_lora_extended, save_lora_weight
 from adapter import TextAdapter
 
@@ -79,21 +78,24 @@ def main(args):
         os.makedirs(args.output_dir, exist_ok=True)
 
     # Blocks to inject LoRA
-    VIS_REPLACE_MODULES = {"ResnetBlock2D", "CrossAttention", "Attention", "GEGLU"}
-    TEXT_ENCODER_REPLACE_MODULES = {"T5Attention"}
+    VIS_REPLACE_MODULES = {"Conv2d", "Linear"}
+    TEXT_ENCODER_REPLACE_MODULES = {"MultiheadAttention"}
 
     # Modules of T2I diffusion models
-    vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae")
-    vis = UNet2DConditionModel.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="unet")
-    noise_scheduler = DDPMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4",
-                                                    subfolder="scheduler")
-    tokenizer = AutoTokenizer.from_pretrained("t5-large")
-    text_encoder = T5EncoderModel.from_pretrained("t5-large")
+    vis = SimpleUnet()
+    vis.load_state_dict(torch.load('diffusion_model.pt'))
+    noise_scheduler = SimpleUnet()
+    noise_scheduler.load_state_dict(torch.load('diffusion_model.pt'))
+    tokenizer = PositionalEncoding
+    text_encoder = TransformerModel(ntoken=10000, d_model=200, d_hid=200,
+                                    nlayers=2,
+                                    nhead=2,
+                                    dropout=0.2)
+    text_encoder.load_state_dict(torch.load('encoder_transformer.pt'))
     adapter = TextAdapter(1024, 896, 768)
 
     vis.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    vae.requires_grad_(False)
 
     # LoRA injection
     vis_lora_params, _ = inject_trainable_lora_extended(
@@ -124,11 +126,10 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size,
                                                    shuffle=True, num_workers=1)
 
-    vis, text_encoder, adapter, vae, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+    vis, text_encoder, adapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         vis,
         text_encoder,
         adapter,
-        vae,
         optimizer,
         train_dataloader,
         lr_scheduler,
@@ -157,7 +158,7 @@ def main(args):
 
         for _, batch in enumerate(train_dataloader):
             # Latent preparation
-            latents = vae.encode(batch[0]).latent_dist.sample()
+            latents = text_encoder.encode(batch[0]).latent_dist.sample()
             latents = latents * 0.18215
             noise = torch.randn_like(latents)
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps,
@@ -168,10 +169,7 @@ def main(args):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             text_input = tokenizer(
                 batch[1],
-                padding="max_length",
-                max_length=77,
-                return_tensors="pt",
-                truncation=True,
+                max_len=77,
             ).input_ids.to(accelerator.device)
             encoder_hidden_states_pre = text_encoder(text_input)[0]
             encoder_hidden_states = adapter(encoder_hidden_states_pre).sample
